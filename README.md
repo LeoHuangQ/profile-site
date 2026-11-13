@@ -3,6 +3,8 @@
 Simple personal project site. Static HTML/CSS/JS, no framework, no build
 step. Hosted on AWS **S3 + CloudFront** (see `DEPLOY.md`).
 
+Address link in AWS: https://d8yh0awzcw6be.cloudfront.net/
+
 ## Local preview
 
 ```sh
