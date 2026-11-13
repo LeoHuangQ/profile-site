@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<title>Jump Recognition Validator · No Game</title>
+<style>body{font-family:system-ui;max-width:760px;margin:24px auto;padding:0 16px}
+video,canvas{width:640px;max-width:100%;height:480px;background:#111}
+canvas{margin-top:-484px;display:block;position:relative;pointer-events:none}
+button{padding:8px 14px;margin-right:8px} .row{margin:10px 0}
+#jump{font-size:48px;height:64px} .fire{color:#16a34a} #log{white-space:pre-wrap;background:#f4f4f4;padding:10px}</style>
+<script type="importmap">{"imports":{"@mediapipe/tasks-vision":"https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/+esm"}}</script>
+</head><body>
+<h1>Jump Recognition Validator (Recognition First, Game Later)</h1>
+<p>Flow: open the camera → stand straight and calibrate for 2 seconds → load model.json → jump, and watch P(jump) and the events. The Space key also triggers, as a fallback check.</p>
+<div class="row"><button id="cam">Open camera</button><button id="cal" disabled>Calibrate 2s</button>
+<button id="load" disabled>Load model</button></div>
+<video id="v" playsinline muted></video><canvas id="c" width="640" height="480"></canvas>
+<div class="row" id="status">Status: camera not opened</div>
+<div id="jump">—</div>
+<div class="row" id="probs">P(jump) — / P(stand) — / P(squat) —</div>
+<div class="row" id="feat">Features: rise — / ankleRise — / kneeFlex — / hipVel —</div>
+<div class="row" id="perf">FPS — / inference latency — ms</div>
+<div id="log"></div>
+<script type="module">
+import { createLandmarker, startCamera, drawSkeleton } from "./pose.mjs";
+import { frameFeatures, pushWindow, calibrationFromFrames } from "../src/features.mjs";
+import { predictProbs, JumpDetector } from "../src/modelDetector.mjs";
+const $ = id => document.getElementById(id);
+const video = $("v"), ctx = $("c").getContext("2d");
+let landmarker = null, calibration = null, model = null, detector = null;
+let state = { prevRise: null, prevVel: 0, prevT: null, t: 0 };
+let featWindow = [], calibrating = false, calFrames = [], frames = 0, lastFpsT = performance.now();
+const setStatus = m => $("status").textContent = "Status: " + m;
+const fire = (src) => {
+  $("jump").textContent = "JUMP! (" + src + ")"; $("jump").className = "fire";
+  $("log").textContent = new Date().toLocaleTimeString() + " onJump via " + src + "\n" + $("log").textContent;
+  setTimeout(() => { $("jump").textContent = "—"; $("jump").className = ""; }, 600);
+};
+globalThis.addEventListener("keydown", e => { if (e.code === "Space") { e.preventDefault(); fire("keyboard"); } });
+$("cam").onclick = async () => {
+  try {
+    landmarker = await createLandmarker(); await startCamera(video);
+    $("cal").disabled = false; setStatus("Camera opened. Stand straight, then calibrate.");
+    let last = -1;
+    const loop = () => {
+      if (video.currentTime !== last) {
+        last = video.currentTime; frames++;
+        const now = performance.now();
+        if (now - lastFpsT >= 1000) { $("perf").textContent = `FPS ${frames} / inference latency — ms`; frames = 0; lastFpsT = now; }
+        const res = landmarker.detectForVideo(video, now);
+        const lm = res.landmarks?.[0]?.map(p => [p.x, p.y, p.z, p.visibility ?? 1]);
+        if (!lm) { requestAnimationFrame(loop); return; }
+        drawSkeleton(ctx, lm, 640, 480);
+        if (calibrating) calFrames.push(lm);
+        if (calibration && model) {
+          state.t = now / 1000;
+          const feat = frameFeatures(lm, calibration, state);
+          if (feat) {
+            $("feat").textContent = `Features: rise ${feat[0].toFixed(2)} / ankleRise ${feat[1].toFixed(2)} / kneeFlex ${feat[2].toFixed(2)} / hipVel ${feat[3].toFixed(2)}`;
+            const t0 = performance.now();
+            const vec = pushWindow(featWindow, feat);
+            if (vec) {
+              const probs = predictProbs(model, vec);
+              const dt = performance.now() - t0;
+              $("probs").textContent = `P(jump) ${probs.jump.toFixed(2)} / P(stand) ${probs.stand.toFixed(2)} / P(squat) ${probs.squat.toFixed(2)}`;
+              $("perf").textContent = $("perf").textContent.replace(/inference latency — ms/, `inference latency ${dt.toFixed(1)} ms`);
+              if (detector.update(probs, feat[0], now)) fire("model");
+            }
+          }
+        }
+      }
+      requestAnimationFrame(loop);
+    };
+    loop();
+  } catch (e) { setStatus("Failed: " + e.message); }
+};
+$("cal").onclick = () => {
+  calibrating = true; calFrames = []; setStatus("Calibrating — stand still for 2 seconds…");
+  setTimeout(() => { calibrating = false; calibration = calibrationFromFrames(calFrames);
+    if (!calibration) { setStatus("Calibration failed"); return; }
+    $("load").disabled = false; setStatus(`Calibration done: scale=${calibration.scale.toFixed(3)}. Now load the model.`); }, 2000);
+};
+$("load").onclick = async () => {
+  try {
+    model = await (await fetch("../model/model.json")).json();
+    detector = new JumpDetector(model.decision); featWindow = [];
+    setStatus(`Model loaded: ${model.version}, threshold ${model.decision.jumpThreshold}. Try jumping.`);
+  } catch (e) { setStatus("Failed to load model: run training first, or open via a local server (do not open via file:// — fetch will be blocked)"); }
+};
+</script></body></html>

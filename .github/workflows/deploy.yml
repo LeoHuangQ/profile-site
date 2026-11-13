@@ -1,0 +1,40 @@
+# Deploy the showcase site to S3 + CloudFront on every push to main.
+# Required secrets (repo Settings → Secrets and variables → Actions):
+#   AWS_ROLE_TO_ASSUME  – IAM role ARN for GitHub OIDC (recommended), or
+#   AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY (long-lived keys, less safe)
+# Required variables (same place, Variables tab):
+#   S3_BUCKET            – e.g. leo-showcase-site
+#   CLOUDFRONT_DISTRIBUTION_ID – e.g. E1234567890ABC (empty = skip invalidation)
+name: Deploy showcase site
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: us-east-1
+
+      - name: Sync to S3
+        run: |
+          aws s3 sync . "s3://${{ vars.S3_BUCKET }}" --delete \
+            --exclude ".git/*" --exclude ".github/*"
+
+      - name: Invalidate CloudFront cache
+        if: vars.CLOUDFRONT_DISTRIBUTION_ID != ''
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id "${{ vars.CLOUDFRONT_DISTRIBUTION_ID }}" \
+            --paths "/*"

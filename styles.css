@@ -1,0 +1,74 @@
+/* Leo Huang — showcase site. Simple, no framework, no build step. */
+:root {
+  --ink: #111;
+  --muted: #666;
+  --line: #e5e5e5;
+  --accent: #9333ea;
+  --bg: #fff;
+  --card: #fafafa;
+}
+* { box-sizing: border-box; }
+body {
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  color: var(--ink);
+  background: var(--bg);
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 48px 20px 32px;
+  line-height: 1.6;
+}
+h1 { font-size: 2.2rem; margin: 0 0 4px; letter-spacing: -0.02em; }
+h2 { font-size: 1.25rem; margin: 40px 0 16px; }
+.role { color: var(--muted); margin: 0 0 16px; }
+.bio { max-width: 640px; margin: 0 0 20px; }
+.links a { color: var(--ink); margin-right: 20px; text-underline-offset: 3px; }
+.links a:hover { color: var(--accent); }
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 16px;
+}
+.tile {
+  display: block;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 20px;
+  color: inherit;
+  text-decoration: none;
+  transition: transform 0.12s ease, border-color 0.12s ease, box-shadow 0.12s ease;
+}
+.tile:hover {
+  transform: translateY(-2px);
+  border-color: var(--accent);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.08);
+}
+.tile .icon { font-size: 1.8rem; line-height: 1; }
+.tile h3 { margin: 12px 0 6px; font-size: 1.1rem; }
+.tile p { margin: 0 0 12px; color: var(--muted); font-size: 0.95rem; }
+.tile .tags { display: flex; flex-wrap: wrap; gap: 6px; }
+.tile .tag {
+  font-size: 0.8rem;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 2px 8px;
+  color: var(--muted);
+  background: #fff;
+}
+.tile .go { display: block; margin-top: 14px; font-size: 0.9rem; color: var(--accent); }
+.tile.more {
+  border-style: dashed;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  min-height: 180px;
+  color: var(--muted);
+}
+.tile.more h3 { color: var(--ink); }
+.hint { color: var(--muted); font-size: 0.9rem; margin-top: 20px; }
+footer { margin-top: 48px; color: var(--muted); font-size: 0.85rem; border-top: 1px solid var(--line); padding-top: 16px; }
+@media (max-width: 600px) {
+  body { padding: 32px 16px 24px; }
+  h1 { font-size: 1.8rem; }
+}

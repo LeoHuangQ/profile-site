@@ -1,0 +1,636 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<title>Jump Game · Camera + Keyboard</title>
+<style>body{font-family:system-ui;max-width:1000px;margin:24px auto;padding:0 16px}
+button{padding:8px 14px;margin-right:8px} .row{margin:10px 0}
+#stage{position:relative;width:960px;max-width:100%}
+#game{width:960px;max-width:100%;height:432px;background:#eaf6ff;border:2px solid #333;display:block;cursor:pointer}
+#camWrap{position:absolute;top:8px;right:8px;width:200px;border:2px solid #333;background:#111;opacity:0.95}
+video{width:200px;height:150px;background:#111;display:block}
+#skel{position:absolute;left:0;top:0;width:200px;height:150px;pointer-events:none}
+#flash{font-size:28px;height:36px} .fire{color:#16a34a}
+#log{white-space:pre-wrap;background:#f4f4f4;padding:10px;max-height:120px;overflow:auto}</style>
+<script type="importmap">{"imports":{"@mediapipe/tasks-vision":"https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.18/+esm"}}</script>
+</head><body>
+<h1>Jump Game — Purple Cat</h1>
+<p id="buildStamp" style="display:none">Build 2026-11-06-g — default: close-up, no buttons unless ?mode=test</p>
+<p id="details" style="display:none"><b>Modes:</b> <b>Close-up (upper body)</b> is the default — only shoulders and up need to be in frame; it uses a shoulder-rise rule instead of the MLP (no ankle/knee signal, so it is easier to trigger by mistake). <b>Full body</b> is the original MLP model — head to ankles must be in frame (test mode only). Calibration and model loading are both automatic: the model loads on page open, calibration runs during the 3-second countdown on first visit. Hand gestures (camera on): raise both hands above your shoulders and hold ~0.8 s to start / resume; cross both hands and hold ~0.4 s to pause — any height counts, as long as the hands are crossed. All buttons and debug lines are test controls — they only show when the page is opened with <code>?mode=test</code> in the URL.</p>
+<div class="row" id="modeRow" style="display:none">
+  <button id="modeFull">Full body</button>
+  <button id="modeClose" disabled>Close-up (upper body)</button>
+</div>
+<div class="row" id="controls" style="display:none">
+  <button id="cam">Play with Camera</button>
+  <button id="start">Start game (keyboard)</button>
+  <button id="pause" disabled>Pause</button>
+  <button id="jumpBtn">Jump (tap)</button>
+  <button id="cal" disabled style="display:none">Recalibrate</button>
+  <button id="load" style="display:none">Reload model</button>
+</div>
+<div class="row" id="gesture">Gesture: — (camera off)</div>
+<div class="row" id="testBadge" style="display:none">Test mode ON — all buttons and debug lines shown. Build 2026-11-06-g.</div>
+<div class="row" id="gestureDebug" style="display:none">Gesture debug: —</div>
+<div id="stage">
+  <canvas id="game" width="960" height="432"></canvas>
+  <div id="camWrap"><video id="v" playsinline muted></video><canvas id="skel" width="200" height="150"></canvas></div>
+</div>
+<div class="row" id="score">Score: 0 &nbsp;|&nbsp; Best: 0 &nbsp;|&nbsp; Speed: 0 px/s</div>
+<div class="row" id="status">Status: loading model… Space works immediately, no setup needed.</div>
+<div id="flash">—</div>
+<div class="row" id="probs" style="display:none">Model: not loaded — P(jump) — / P(stand) — / P(squat) —</div>
+<div class="row" id="feat" style="display:none">Features: rise — / ankleRise — / kneeFlex — / hipVel —</div>
+<div id="log" style="display:none"></div>
+<script type="module">
+import { createLandmarker, startCamera, drawSkeleton } from "./pose.mjs";
+import { frameFeatures, pushWindow, calibrationFromFrames } from "../src/features.mjs";
+import { predictProbs, JumpDetector } from "../src/modelDetector.mjs";
+import { RunnerGame } from "../src/gameEngine.mjs";
+const $ = id => document.getElementById(id);
+const canvas = $("game"), ctx = canvas.getContext("2d");
+const video = $("v"), skelCtx = $("skel").getContext("2d");
+const game = new RunnerGame();
+let landmarker = null, calibration = null, model = null, detector = null;
+let state = { prevRise: null, prevVel: 0, prevT: null, t: 0 };
+let featWindow = [], calibrating = false, calFrames = [];
+let best = 0;
+try { best = Number(localStorage.getItem("jumpGameBest") || 0) || 0; } catch (e) { best = 0; }
+const setStatus = m => $("status").textContent = "Status: " + m;
+const log = m => { $("log").textContent = new Date().toLocaleTimeString() + " " + m + "\n" + $("log").textContent; };
+// --- Streamlined setup: model auto-loads, calibration auto-runs and is saved ---
+// Why calibration cannot be removed entirely: rise is measured against a
+// standing baseline (hipY/ankleY/scale). Without it, near/far camera distance
+// changes the answer. What CAN be removed is asking for it every time:
+// the model is tiny (42 KB) so it loads on page open, calibration runs
+// automatically once the camera opens, and a good calibration is saved in
+// localStorage and reused on the next visit. Only re-do it if you moved.
+const CAL_KEY = "jumpGameCalibration";
+function loadSavedCalibration() {
+  try {
+    const c = JSON.parse(localStorage.getItem(CAL_KEY) || "null");
+    if (c && [c.hipY, c.ankleY, c.scale].every(v => Number.isFinite(v)) && c.scale >= 0.05) return c;
+  } catch (e) {}
+  return null;
+}
+function saveCalibration() {
+  try { localStorage.setItem(CAL_KEY, JSON.stringify(calibration)); } catch (e) {}
+}
+// --- Close-up (upper-body) mode ---
+// Full-body mode needs shoulders + hips + knees + ankles (8 points) and
+// drops any frame where one is below visibility 0.5 — that is why it
+// needs the whole body in frame and ~2–2.5 m of distance. Close-up mode
+// needs only the shoulders (11/12): jump is measured as shoulder-rise
+// against shoulder width, a rule detector instead of the MLP.
+//   rise = (cal.shoulderY - shoulderY) / cal.shoulderWidth
+// A 10–20 cm jump is ~0.20–0.40 in these units, so the fire threshold
+// is 0.20 with re-arm below 0.05. Trade-off, stated plainly: squat still
+// reads negative (no false jump), but without ankle/knee signal a big
+// bounce, tiptoe or shrug is more likely to fire than in full-body mode.
+// No retraining is needed for this mode — it is a rule, not a model.
+let mode = "close"; // "full" | "close" — close-up (upper body) is the default
+let closeCalibration = null;
+let closeState = { prevRise: null, prevVel: 0, prevT: null, armed: true, lastFire: 0 };
+const CAL_CLOSE_KEY = "jumpGameCalibrationClose";
+function loadSavedCloseCalibration() {
+  try {
+    const c = JSON.parse(localStorage.getItem(CAL_CLOSE_KEY) || "null");
+    if (c && [c.shoulderY, c.shoulderWidth].every(v => Number.isFinite(v)) && c.shoulderWidth >= 0.02) return c;
+  } catch (e) {}
+  return null;
+}
+function saveCloseCalibration() {
+  try { localStorage.setItem(CAL_CLOSE_KEY, JSON.stringify(closeCalibration)); } catch (e) {}
+}
+function calibrationCloseFromFrames(frames) {
+  const med = xs => { const s = [...xs].sort((a, b) => a - b); return s[Math.floor(s.length / 2)]; };
+  const ys = [], ws = [];
+  for (const lm of frames) {
+    if (!lm || lm[11][3] < 0.5 || lm[12][3] < 0.5) continue;
+    ys.push((lm[11][1] + lm[12][1]) / 2);
+    ws.push(Math.max(0.02, Math.hypot(lm[11][0] - lm[12][0], lm[11][1] - lm[12][1])));
+  }
+  if (!ys.length) return null;
+  return { shoulderY: med(ys), shoulderWidth: med(ws) };
+}
+function setMode(m) {
+  if (m === mode) return;
+  mode = m;
+  closeState = { prevRise: null, prevVel: 0, prevT: null, armed: true, lastFire: 0 };
+  featWindow = [];
+  $("modeFull").disabled = (m === "full");
+  $("modeClose").disabled = (m === "close");
+  if (m === "close") {
+    setStatus(closeCalibration ? "Close-up mode (upper body only). Saved close-up calibration loaded — Recalibrate if you moved." : "Close-up mode (upper body only). No close-up calibration yet — it will run during the 3-second countdown.");
+    log("Mode: close-up (upper body, shoulder-rise rule, threshold 0.20). No ankle/knee signal, so expect more false jumps than full-body mode.");
+  } else {
+    setStatus(calibration ? "Full-body mode. Saved calibration loaded." : "Full-body mode. No saved calibration yet.");
+    log("Mode: full body (MLP model).");
+  }
+}
+async function loadModel() {
+  try {
+    model = await (await fetch("../model/model.json")).json();
+    // v1 threshold-name gap: model.json stores jumpThreshold, but
+    // JumpDetector reads threshold, so pass it explicitly here.
+    detector = new JumpDetector({ threshold: model.decision.jumpThreshold, cooldownMs: model.decision.cooldownMs });
+    featWindow = [];
+    $("probs").textContent = `Model: auto-loaded (${model.version}) — P(jump) — / P(stand) — / P(squat) —`;
+    log(`Model auto-loaded: ${model.version}`);
+    return true;
+  } catch (e) {
+    setStatus("Model auto-load failed — keyboard mode still works. Click Reload model to retry (needs a local server, not file://).");
+    return false;
+  }
+}
+// --- 3-second countdown at game start ---
+// The countdown is not dead time: it is the window used to calibrate
+// (stand still while it runs) and to finish loading the model (the
+// 42 KB model.json fetch, usually already done on page open). The big
+// number is drawn on the game canvas by render(); the status line
+// shows the same count. Double starts are ignored while it runs.
+let countdown = 0, countdownLabel = "", countdownTimer = null;
+function runCountdown({ label, calibrate, onDone }) {
+  if (countdownTimer) return;
+  countdown = 3; countdownLabel = label;
+  if (calibrate) { calibrating = true; calFrames = []; }
+  setStatus(`${label} — 3…`);
+  countdownTimer = setInterval(() => {
+    countdown -= 1;
+    if (countdown <= 0) {
+      clearInterval(countdownTimer); countdownTimer = null; countdown = 0;
+      if (calibrate) {
+        calibrating = false;
+        if (mode === "close") {
+          closeCalibration = calibrationCloseFromFrames(calFrames);
+          if (!closeCalibration) { setStatus("Close-up calibration failed: no shoulders detected. Click Recalibrate, or play with Space."); return; }
+          saveCloseCalibration();
+          setStatus(`Close-up calibration done: shoulderWidth=${closeCalibration.shoulderWidth.toFixed(3)} (saved for next time).`);
+          log("Close-up calibration saved for next visit");
+        } else {
+          calibration = calibrationFromFrames(calFrames);
+          if (!calibration) { setStatus("Calibration failed: no person detected. Click Recalibrate, or play with Space."); return; }
+          saveCalibration();
+          setStatus(`Calibration done: scale=${calibration.scale.toFixed(3)} (saved for next time).`);
+          log("Calibration saved for next visit");
+        }
+      }
+      if (onDone) onDone();
+    } else {
+      setStatus(`${label} — ${countdown}…`);
+    }
+  }, 1000);
+}
+// Start a game after a 3-second countdown. Calibration runs during the
+// countdown when there is no saved calibration; the model load (kicked
+// off on page open, retried here if it failed) also gets those 3 seconds.
+function beginGame() {
+  if (countdownTimer || game.state === "playing") return;
+  // Model loading is automatic: it loads on page open, and is retried
+  // here if it failed, finishing during the countdown.
+  if (!model) loadModel();
+  const needCalibration = mode === "close" ? !closeCalibration : !calibration;
+  runCountdown({
+    label: needCalibration ? "Calibrating — stand still" : "Get ready",
+    calibrate: needCalibration,
+    onDone: startGame,
+  });
+}
+// Recalibrate on its own: same 3-second countdown, no game start after it.
+function startCalibration() {
+  runCountdown({ label: "Recalibrating — stand still", calibrate: true, onDone: null });
+}
+// Model loads in the background on page open; the player never clicks for it.
+loadModel();
+calibration = loadSavedCalibration();
+closeCalibration = loadSavedCloseCalibration();
+if (calibration) log("Using saved calibration from last visit — Recalibrate if you moved.");
+if (closeCalibration) log("Using saved close-up calibration from last visit.");
+$("modeFull").onclick = () => setMode("full");
+$("modeClose").onclick = () => setMode("close");
+// Test controls: mode switch, Recalibrate and Reload model are kept for
+// testing, but hidden by default. Open the page with ?mode=test in the
+// URL to show them, e.g. web/game.html?mode=test — the default link
+// (no query) shows only the game controls, with close-up as the default
+// mode and calibration + model loading fully automatic.
+// Accept ?mode=test, ?test=1, ?test, and #test, so a slightly different
+// test URL still works. The "Test mode ON" badge + build stamp below
+// tell you at a glance whether this copy actually has the test code —
+// if the badge does not appear on ?mode=test, you are looking at a
+// cached / old copy: replace the file and hard-refresh (Cmd+Shift+R).
+const BUILD = "2026-11-06-g";
+const _qs = new URLSearchParams(location.search);
+const isTestMode = _qs.get("mode") === "test" || _qs.has("test") || _qs.get("test") === "1" || location.hash.includes("test");
+log(`Game build ${BUILD} — test mode ${isTestMode ? "ON" : "off"}`);
+// Test buttons are hidden BY DEFAULT IN THE HTML (style="display:none"),
+// not hidden by this script. The old code did it the other way round —
+// buttons visible in the HTML, JS hiding them — so if the script never
+// ran (old cached file, module failed to load), the buttons stayed
+// visible forever and no "Test mode ON" badge ever appeared, which is
+// exactly what was reported. Now only test mode shows them.
+if (isTestMode) {
+  $("testBadge").style.display = "";
+  $("buildStamp").style.display = "";
+  $("gestureDebug").style.display = "";
+  $("modeRow").style.display = "";
+  $("controls").style.display = "";
+  $("cal").style.display = "";
+  $("load").style.display = "";
+  $("probs").style.display = "";
+  $("feat").style.display = "";
+  $("log").style.display = "";
+  $("details").style.display = "";
+}
+function flash(src) {
+  $("flash").textContent = "JUMP! (" + src + ")"; $("flash").className = "fire";
+  setTimeout(() => { $("flash").textContent = "—"; $("flash").className = ""; }, 600);
+}
+// The ONLY place the game receives a jump. Camera, keyboard and tap all
+// converge here, so the game never knows (or cares) where it came from.
+function onJump(src) {
+  if (game.state !== "playing") return;
+  if (game.jump()) { flash(src); log("onJump via " + src); }
+}
+function startGame() {
+  game.start(); $("pause").disabled = false; $("pause").textContent = "Pause";
+  if (mode === "close") {
+    if (!closeCalibration) setStatus("Playing with keyboard/tap only (close-up calibration not ready).");
+    else setStatus("Playing (close-up). Jump in front of the camera, or press Space.");
+  } else if (!model || !calibration) setStatus("Playing with keyboard/tap only (camera model or calibration not ready).");
+  else setStatus("Playing. Jump in front of the camera, or press Space.");
+  log("Game started");
+}
+// Resume after a pause also gets the 3-second countdown, same as a start.
+function resumeGame() {
+  if (countdownTimer || !game.paused) return;
+  runCountdown({
+    label: "Resuming — get ready",
+    calibrate: false,
+    onDone: () => {
+      game.paused = false; $("pause").textContent = "Pause";
+      if (mode === "close") setStatus("Playing (close-up). Jump in front of the camera, or press Space.");
+      else setStatus("Playing. Jump in front of the camera, or press Space.");
+      log("Game resumed");
+    },
+  });
+}
+function gameOver() {
+  $("pause").disabled = true;
+  const finalScore = Math.floor(game.score);
+  if (finalScore > best) {
+    best = finalScore;
+    try { localStorage.setItem("jumpGameBest", String(best)); } catch (e) {}
+  }
+  setStatus(`Game over! Score ${finalScore}. Press Start game or Space to play again.`);
+  log(`Game over, score ${finalScore}`);
+}
+$("start").onclick = beginGame;
+$("pause").onclick = () => {
+  if (game.state !== "playing") return;
+  if (game.paused) { resumeGame(); return; }
+  game.paused = true;
+  $("pause").textContent = "Resume";
+};
+$("jumpBtn").onclick = () => onJump("tap");
+// Start from Space / a tap on the game: open the camera first if it is
+// not open yet (so hand gestures work too), then the 3-second countdown.
+async function startWithCamera() {
+  if (!landmarker) { try { await openCamera(); } catch (e) {} }
+  beginGame();
+}
+globalThis.addEventListener("keydown", e => {
+  if (e.code !== "Space" && e.code !== "ArrowUp") return;
+  e.preventDefault();
+  if (countdownTimer) return; // Space during the countdown does nothing
+  if (game.paused) { resumeGame(); return; } // Space resumes, with the countdown
+  if (game.state === "over" || game.state === "idle") startWithCamera();
+  else onJump("keyboard"); // Space mid-air = the 2nd jump (double jump)
+});
+canvas.onclick = () => {
+  if (countdownTimer) return;
+  if (game.paused) { resumeGame(); return; }
+  if (game.state === "over" || game.state === "idle") startWithCamera();
+  else onJump("tap");
+};
+// --- Hand gestures (camera on, both modes) ---
+// Landmarks: wrists 15 (left) / 16 (right), shoulders 11/12, hips 23/24.
+// y grows downwards, so "above the shoulders" means a smaller y.
+// Both hands up: both wrists above the shoulder line.
+// Hands crossed: both wrists together near chest height, with the left
+// wrist no longer clearly on its own (image-right) side.
+//   Why the old cross check failed: it required the left wrist to be
+//   clearly image-left of the right wrist (x15 < x16 - 0.02). When the
+//   hands are actually crossed tight, the wrists overlap, so their x
+//   difference is ~0 and the check never fired. It also required wrist
+//   visibility >= 0.5, but a crossed wrist occludes the other one, so
+//   its visibility flickers below 0.5 — and any single dropped frame
+//   reset the 0.4 s hold timer to zero. The new check therefore uses
+//   wrist closeness + chest height instead of a strict x order, allows
+//   wrist visibility down to 0.3, and tolerates a 300 ms flicker gap
+//   without resetting the hold.
+//   hands up    -> start (idle/over) or resume (paused); ignored while playing
+//   hands crossed -> pause (playing only); resume with hands up / Pause button
+const GESTURE_HOLD_MS = 800; // both hands up
+const CROSS_HOLD_MS = 400; // hands crossed — shortened, 0.8 s felt too slow to pause
+const GESTURE_FLICKER_MS = 300; // brief detection gap that does not reset the hold
+let gestureHold = { type: null, since: 0, fired: false, lastSeen: 0 };
+const vis = (lm, i) => lm[i] && lm[i][3] >= 0.5;
+const visWrist = (lm, i) => lm[i] && lm[i][3] >= 0.3; // crossed wrists occlude each other
+function handsUp(lm) {
+  if (!visWrist(lm, 15) || !visWrist(lm, 16) || !vis(lm, 11) || !vis(lm, 12)) return false;
+  const shoulderY = (lm[11][1] + lm[12][1]) / 2;
+  const wristDist = Math.hypot(lm[15][0] - lm[16][0], lm[15][1] - lm[16][1]);
+  // Clearly above the shoulders (not just barely), wrists apart, and
+  // not crossed: the left wrist must still be on its own (image-right)
+  // side. The old bar was only 0.03 above the shoulder line, so a cross
+  // done high on the upper chest was read as "hands up" and the cross
+  // check never got a chance — the Gesture line only ever showed
+  // "hands up 100%".
+  return lm[15][1] < shoulderY - 0.08 && lm[16][1] < shoulderY - 0.08
+    && wristDist > 0.10 && lm[15][0] > lm[16][0] - 0.02;
+}
+function handsCrossed(lm) {
+  if (!visWrist(lm, 15) || !visWrist(lm, 16) || !vis(lm, 11) || !vis(lm, 12)) return false;
+  // Crossed = the left wrist is on the image-left side of the right
+  // wrist. Normally it is the other way round (facing the camera, the
+  // person's left is the image's right), so the x order flipping is
+  // the cross itself. No height rule at all: chest, waist, above the
+  // head — any height counts, per the user's call. The earlier versions
+  // kept adding height / closeness conditions (chest height, wrists
+  // together, not too high) and each one rejected a real cross, so
+  // they are all removed. Arms at the sides or raised apart fail this
+  // because their x order is the normal one (left wrist image-right).
+  return lm[15][0] < lm[16][0] - 0.005;
+}
+function updateGestures(lm, now) {
+  let type = null;
+  // Cross first: a cross done high can also satisfy "wrists above the
+  // shoulders", and checking up first stole it every time.
+  if (handsCrossed(lm)) type = "cross";
+  else if (handsUp(lm)) type = "up";
+  if (isTestMode) {
+    const shoulderY = (lm[11][1] + lm[12][1]) / 2;
+    $("gestureDebug").textContent = `Gesture debug: shoulderY=${shoulderY.toFixed(2)} L15 (${lm[15][0].toFixed(2)}, ${lm[15][1].toFixed(2)}, v${lm[15][3].toFixed(2)}) R16 (${lm[16][0].toFixed(2)}, ${lm[16][1].toFixed(2)}, v${lm[16][3].toFixed(2)}) up=${handsUp(lm)} cross=${handsCrossed(lm)}`;
+  }
+  if (!type) {
+    // Flicker grace: a brief gap (occlusion / jitter) does not reset
+    // the hold timer; only a gap longer than 300 ms does.
+    if (gestureHold.type && now - gestureHold.lastSeen < GESTURE_FLICKER_MS) {
+      const holdMs = gestureHold.type === "cross" ? CROSS_HOLD_MS : GESTURE_HOLD_MS;
+      const held = now - gestureHold.since;
+      $("gesture").textContent = `Gesture: ${gestureHold.type === "up" ? "hands up" : "hands crossed"} — hold ${Math.min(100, Math.floor(held / holdMs * 100))}%`;
+      return;
+    }
+    if (gestureHold.type) $("gesture").textContent = "Gesture: —";
+    gestureHold = { type: null, since: 0, fired: false, lastSeen: 0 };
+    return;
+  }
+  if (gestureHold.type !== type) gestureHold = { type, since: now, fired: false, lastSeen: now };
+  else gestureHold.lastSeen = now;
+  const holdMs = type === "cross" ? CROSS_HOLD_MS : GESTURE_HOLD_MS;
+  const held = now - gestureHold.since;
+  $("gesture").textContent = `Gesture: ${type === "up" ? "hands up" : "hands crossed"} — hold ${Math.min(100, Math.floor(held / holdMs * 100))}%`;
+  if (held >= holdMs && !gestureHold.fired) {
+    gestureHold.fired = true;
+    if (type === "up") {
+      if (game.paused) {
+        log("Hands up — resuming game");
+        resumeGame();
+      } else if (game.state === "idle" || game.state === "over") {
+        log("Hands up — starting game");
+        beginGame();
+      } else if (game.state === "playing") {
+        // Hands up is also Start / Pause: raise both hands mid-game to
+        // pause it (crossed hands pauses too). Raise them again to resume.
+        game.paused = true; $("pause").textContent = "Resume";
+        setStatus("Paused by hands up. Raise both hands to resume, or press Resume.");
+        log("Paused via hands-up gesture");
+      }
+    } else if (type === "cross") {
+      if (game.state === "playing" && !game.paused) {
+        game.paused = true; $("pause").textContent = "Resume";
+        setStatus("Paused by crossed hands. Raise both hands to resume, or press Resume.");
+        log("Paused via crossed-hands gesture");
+      }
+    }
+  }
+}
+// --- Camera (one click: open -> auto-calibrate if needed -> start) ---
+async function openCamera() {
+  if (landmarker) return true;
+  landmarker = await createLandmarker(); await startCamera(video);
+  $("cal").disabled = false;
+  let last = -1;
+  const loop = () => {
+    if (video.currentTime !== last) {
+      last = video.currentTime;
+      const now = performance.now();
+      const res = landmarker.detectForVideo(video, now);
+      const lm = res.landmarks?.[0]?.map(p => [p.x, p.y, p.z, p.visibility ?? 1]);
+      if (lm) {
+        drawSkeleton(skelCtx, lm, 200, 150);
+        updateGestures(lm, now);
+        if (calibrating) calFrames.push(lm);
+        if (mode === "close") {
+          // Close-up: shoulder-rise rule, no MLP. Runs only while playing.
+          if (closeCalibration && game.state === "playing" && !game.paused && vis(lm, 11) && vis(lm, 12)) {
+            const shoulderY = (lm[11][1] + lm[12][1]) / 2;
+            const rise = (closeCalibration.shoulderY - shoulderY) / closeCalibration.shoulderWidth;
+            let vel = 0;
+            if (closeState.prevRise !== null && closeState.prevT !== null) {
+              const dt = Math.max(0.01, Math.min(0.1, now / 1000 - closeState.prevT));
+              vel = 0.5 * ((rise - closeState.prevRise) / dt) + 0.5 * closeState.prevVel;
+            }
+            closeState.prevRise = rise; closeState.prevVel = vel; closeState.prevT = now / 1000;
+            $("feat").textContent = `Close-up: shoulderRise ${rise.toFixed(2)} / vel ${vel.toFixed(2)} (fire at rise > 0.20)`;
+            if (closeState.armed && rise > 0.20 && now - closeState.lastFire > 500) {
+              closeState.armed = false; closeState.lastFire = now; onJump("close-up");
+            }
+            if (rise < 0.05) closeState.armed = true;
+          }
+        } else if (calibration && model && game.state === "playing" && !game.paused) {
+          state.t = now / 1000;
+          const feat = frameFeatures(lm, calibration, state);
+          if (feat) {
+            $("feat").textContent = `Features: rise ${feat[0].toFixed(2)} / ankleRise ${feat[1].toFixed(2)} / kneeFlex ${feat[2].toFixed(2)} / hipVel ${feat[3].toFixed(2)}`;
+            const vec = pushWindow(featWindow, feat);
+            if (vec) {
+              const probs = predictProbs(model, vec);
+              $("probs").textContent = `Model: loaded — P(jump) ${probs.jump.toFixed(2)} / P(stand) ${probs.stand.toFixed(2)} / P(squat) ${probs.squat.toFixed(2)}`;
+              if (detector.update(probs, feat[0], now)) onJump("model");
+            }
+          }
+        }
+      }
+    }
+    requestAnimationFrame(loop);
+  };
+  loop();
+  return true;
+}
+$("cam").onclick = async () => {
+  try {
+    await openCamera();
+    // Countdown doubles as the calibration / model-loading window:
+    // 3 s standing still if there is no saved calibration, otherwise
+    // just 3 s to get ready (and for the model to finish loading).
+    beginGame();
+  } catch (e) { setStatus("Camera failed: " + e.message + " — the game still works with Space."); }
+};
+$("cal").onclick = () => startCalibration();
+$("load").onclick = async () => {
+  if (await loadModel()) setStatus(`Model reloaded: ${model.version}. Press Start game, then jump.`);
+};
+// --- How-to overlay (image mask, shown on first load / while idle) ---
+// The text above the game is gone: the instructions live here, as a
+// picture mask drawn on the canvas itself. It shows on every refresh
+// while the game is idle (the first thing the player sees), and it goes
+// away the moment the game starts (the countdown covers it, then play).
+// Three stick-figure panels, in game coordinates (800x360):
+//   Hands up — Start / Pause | Jump — Play | Hands crossed — Pause
+function drawStickFigure(x, y, pose) {
+  ctx.strokeStyle = "#111"; ctx.lineWidth = 4; ctx.lineCap = "round";
+  ctx.fillStyle = "#111";
+  ctx.beginPath(); ctx.arc(x, y - 42, 9, 0, Math.PI * 2); ctx.fill(); // head
+  ctx.beginPath(); ctx.moveTo(x, y - 33); ctx.lineTo(x, y + 8); ctx.stroke(); // body
+  if (pose === "jump") {
+    // Airborne: legs tucked, arms out.
+    ctx.beginPath(); ctx.moveTo(x, y + 8); ctx.lineTo(x - 12, y + 22); ctx.lineTo(x - 4, y + 30); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(x, y + 8); ctx.lineTo(x + 12, y + 22); ctx.lineTo(x + 4, y + 30); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(x, y - 28); ctx.lineTo(x - 20, y - 18); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(x, y - 28); ctx.lineTo(x + 20, y - 18); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(x - 22, y + 42); ctx.lineTo(x + 22, y + 42); ctx.stroke(); // ground line
+  } else {
+    ctx.beginPath(); ctx.moveTo(x, y + 8); ctx.lineTo(x - 10, y + 42); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(x, y + 8); ctx.lineTo(x + 10, y + 42); ctx.stroke();
+    if (pose === "up") {
+      ctx.beginPath(); ctx.moveTo(x, y - 28); ctx.lineTo(x - 20, y - 58); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(x, y - 28); ctx.lineTo(x + 20, y - 58); ctx.stroke();
+    } else { // cross: arms form an X over the chest
+      ctx.beginPath(); ctx.moveTo(x, y - 28); ctx.lineTo(x + 16, y - 8); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(x, y - 28); ctx.lineTo(x - 16, y - 8); ctx.stroke();
+    }
+  }
+}
+function drawHowToOverlay() {
+  ctx.save();
+  ctx.fillStyle = "rgba(234, 246, 255, 0.92)"; ctx.fillRect(0, 0, 800, 360);
+  ctx.fillStyle = "#111"; ctx.textAlign = "center";
+  ctx.font = "bold 28px system-ui"; ctx.fillText("How to play", 400, 55);
+  const panels = [
+    { x: 150, pose: "up", title: "Hands up", action: "Start / Pause" },
+    { x: 400, pose: "jump", title: "Jump", action: "Play" },
+    { x: 650, pose: "cross", title: "Hands crossed", action: "Pause" },
+  ];
+  for (const p of panels) {
+    drawStickFigure(p.x, 170, p.pose);
+    ctx.font = "bold 20px system-ui"; ctx.fillText(p.title, p.x, 250);
+    ctx.font = "18px system-ui"; ctx.fillText(p.action, p.x, 278);
+  }
+  ctx.font = "16px system-ui"; ctx.fillStyle = "#555";
+  ctx.fillText("Space also works  •  Double jump: jump twice before landing", 400, 325);
+  ctx.restore();
+}
+// --- Game render loop (independent of the pose loop) ---
+let lastT = performance.now(), clouds = [{ x: 100, y: 50 }, { x: 450, y: 80 }, { x: 650, y: 40 }];
+function render() {
+  const now = performance.now();
+  const dt = Math.min((now - lastT) / 1000, 0.05);
+  lastT = now;
+  const hit = game.update(dt);
+  if (hit === "hit") gameOver();
+  // The canvas is 960x432 but the game logic is 800x360: draw scaled
+  // 1.2x so the game looks larger without changing the physics.
+  ctx.setTransform(1.2, 0, 0, 1.2, 0, 0);
+  // Sky, clouds, ground.
+  ctx.fillStyle = "#eaf6ff"; ctx.fillRect(0, 0, 800, 360);
+  ctx.fillStyle = "#ffffff";
+  for (const c of clouds) {
+    c.x -= 12 * dt; if (c.x < -80) c.x = 820;
+    ctx.beginPath(); ctx.ellipse(c.x, c.y, 34, 16, 0, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.fillStyle = "#8b5a2b"; ctx.fillRect(0, game.groundY, 800, 360 - game.groundY);
+  ctx.fillStyle = "#16a34a"; ctx.fillRect(0, game.groundY, 800, 4);
+  // Player: a purple cat. Drawing only — the hitbox stays the
+  // 36×48 rectangle in gameEngine.mjs, so gameplay does not change.
+  // Two forms, purely visual:
+  //   walking (playing + grounded): feet alternate stepping, body bobs
+  //     slightly, tail sways — the step phase follows game.distance,
+  //     so the legs move faster as the speed grows.
+  //   jumping (airborne): feet tucked together, body stretched taller,
+  //     tail curled high. Standing (idle) is the neutral form.
+  const px = game.playerX, py = game.playerY;
+  const jumping = !game.grounded;
+  const walking = game.state === "playing" && game.grounded;
+  const walkPhase = game.distance * 0.06;
+  const step = walking ? Math.sin(walkPhase) : 0;
+  const bob = walking ? Math.sin(walkPhase * 2) * 1.5 : 0; // body bob, px
+  const cy = py + bob; // upper-body y (head/body follow the bob, feet stay on the ground)
+  const footYBack = jumping ? py + 36 : py + 42 - Math.max(0, step) * 6;
+  const footYFront = jumping ? py + 36 : py + 42 - Math.max(0, -step) * 6;
+  const footXBack = jumping ? px + 9 : px + 6 + step * 4;
+  const footXFront = jumping ? px + 17 : px + 20 - step * 4;
+  // Tail (behind the body, curls higher while airborne, sways while walking).
+  const tailTipX = px + 42 + (walking ? step * 3 : 0);
+  const tailTipY = jumping ? py + 10 : py + 18 + (walking ? Math.sin(walkPhase * 2) * 3 : 0);
+  ctx.strokeStyle = "#7e22ce"; ctx.lineWidth = 5; ctx.lineCap = "round";
+  ctx.beginPath();
+  ctx.moveTo(px + 30, cy + 36);
+  ctx.quadraticCurveTo(px + 44, cy + 32, tailTipX, tailTipY);
+  ctx.stroke();
+  ctx.fillStyle = "#c084fc"; ctx.beginPath(); ctx.arc(tailTipX, tailTipY, 3, 0, Math.PI * 2); ctx.fill();
+  // Body and belly (stretched taller while jumping).
+  ctx.fillStyle = "#9333ea";
+  ctx.beginPath(); ctx.ellipse(px + 18, cy + 34, jumping ? 13 : 14, jumping ? 15 : 14, 0, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = "#c084fc";
+  ctx.beginPath(); ctx.ellipse(px + 18, cy + 36, 8, 7, 0, 0, Math.PI * 2); ctx.fill();
+  // Feet: alternating steps while walking, tucked together while jumping.
+  ctx.fillStyle = "#7e22ce";
+  ctx.fillRect(footXBack, footYBack, 10, 6); ctx.fillRect(footXFront, footYFront, 10, 6);
+  // Head.
+  ctx.fillStyle = "#9333ea";
+  ctx.beginPath(); ctx.arc(px + 18, cy + 14, 13, 0, Math.PI * 2); ctx.fill();
+  // Ears (inside the hitbox top) with pink inner ears.
+  ctx.fillStyle = "#9333ea";
+  ctx.beginPath(); ctx.moveTo(px + 7, cy + 10); ctx.lineTo(px + 12, cy + 1); ctx.lineTo(px + 16, cy + 9); ctx.closePath(); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(px + 20, cy + 9); ctx.lineTo(px + 24, cy + 1); ctx.lineTo(px + 29, cy + 10); ctx.closePath(); ctx.fill();
+  ctx.fillStyle = "#f9a8d4";
+  ctx.beginPath(); ctx.moveTo(px + 10, cy + 8); ctx.lineTo(px + 12, cy + 4); ctx.lineTo(px + 14, cy + 8); ctx.closePath(); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(px + 22, cy + 8); ctx.lineTo(px + 24, cy + 4); ctx.lineTo(px + 26, cy + 8); ctx.closePath(); ctx.fill();
+  // Eyes (green, contrasting with purple), nose, whiskers.
+  ctx.fillStyle = "#fff";
+  ctx.beginPath(); ctx.arc(px + 12, cy + 13, 3.5, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(px + 24, cy + 13, 3.5, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = "#111";
+  ctx.beginPath(); ctx.arc(px + 12, cy + 13, 1.8, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(px + 24, cy + 13, 1.8, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = "#f472b6";
+  ctx.beginPath(); ctx.moveTo(px + 15, cy + 18); ctx.lineTo(px + 21, cy + 18); ctx.lineTo(px + 18, cy + 21); ctx.closePath(); ctx.fill();
+  ctx.strokeStyle = "#e9d5ff"; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(px + 5, cy + 19); ctx.lineTo(px - 1, cy + 17); ctx.moveTo(px + 5, cy + 21); ctx.lineTo(px - 1, cy + 22); ctx.moveTo(px + 31, cy + 19); ctx.lineTo(px + 37, cy + 17); ctx.moveTo(px + 31, cy + 21); ctx.lineTo(px + 37, cy + 22); ctx.stroke();
+  // Obstacles.
+  ctx.fillStyle = "#b91c1c";
+  for (const ob of game.obstacles) {
+    ctx.fillRect(ob.x, game.groundY - ob.height, ob.width, ob.height);
+    ctx.fillStyle = "#7f1d1d"; ctx.fillRect(ob.x, game.groundY - ob.height, ob.width, 6); ctx.fillStyle = "#b91c1c";
+  }
+  // Overlays.
+  ctx.fillStyle = "#111"; ctx.font = "20px system-ui";
+  if (countdown > 0) {
+    ctx.save();
+    ctx.fillStyle = "rgba(234, 246, 255, 0.85)"; ctx.fillRect(0, 0, 800, 360);
+    ctx.fillStyle = "#111"; ctx.textAlign = "center";
+    ctx.font = "bold 96px system-ui"; ctx.fillText(String(countdown), 400, 190);
+    ctx.font = "20px system-ui"; ctx.fillText(countdownLabel, 400, 230);
+    ctx.restore();
+  } else if (game.state === "idle") drawHowToOverlay();
+  if (game.state === "over") ctx.fillText(`Game over! Score ${Math.floor(game.score)} — Space to restart`, 170, 150);
+  if (game.paused && countdown === 0) ctx.fillText("Paused", 360, 150);
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  $("score").textContent = `Score: ${Math.floor(game.score)}  |  Best: ${best}  |  Speed: ${Math.floor(game.speed)} px/s  |  Double jump: ${2 - game.jumpsUsed} left`;
+  requestAnimationFrame(render);
+}
+render();
+// Camera auto-opens on page load, so hand gestures work with no button
+// to click. If permission is denied, Space still plays with the
+// keyboard, and test mode has the Play with Camera button to retry.
+openCamera().catch(e => setStatus("Camera auto-open failed — Space still works with the keyboard; use test mode to retry the camera."));
+</script></body></html>

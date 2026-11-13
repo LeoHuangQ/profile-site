@@ -1,0 +1,51 @@
+{
+  "modelVersion": "jump-model-v1",
+  "dataVersion": "jump-data-v1",
+  "dataset": {
+    "windows": 300,
+    "persons": [
+      "p01",
+      "p02",
+      "p03",
+      "p04",
+      "p05"
+    ],
+    "note": "Synthetic until replaced by recorder exports."
+  },
+  "lopo": {
+    "meanAccuracy": 1.0,
+    "meanFalseTriggerRate": 0.0,
+    "perPersonAccuracy": {
+      "p01": 1.0,
+      "p02": 1.0,
+      "p03": 1.0,
+      "p04": 1.0,
+      "p05": 1.0
+    }
+  },
+  "finalTrainFit": {
+    "accuracy": 1.0,
+    "falseTriggerRate": 0.0,
+    "confusion": [
+      [
+        100,
+        0,
+        0
+      ],
+      [
+        0,
+        100,
+        0
+      ],
+      [
+        0,
+        0,
+        100
+      ]
+    ]
+  },
+  "limits": [
+    "Synthetic data: real-camera accuracy will be lower until recorder data from 3-5 people replaces it.",
+    "Front-facing, full-body framing assumed; side/half-body and dark-light cases are untested in v1."
+  ]
+}
