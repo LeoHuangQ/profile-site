@@ -5,6 +5,9 @@ step. Hosted on AWS **S3 + CloudFront** (see `DEPLOY.md`).
 
 Address link in AWS: https://d8yh0awzcw6be.cloudfront.net/
 
+<img width="719" height="764" alt="Screenshot 2026-11-13 at 11 43 21 AM" src="https://github.com/user-attachments/assets/1a06204c-f401-49e3-8e00-1577680e6e54" />
+
+
 ## Local preview
 
 ```sh
